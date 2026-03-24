@@ -33,16 +33,10 @@ impl BrowserBridge {
         let client = Arc::new(DaemonClient::new(self.port));
 
         if client.is_running().await {
-            // Port is occupied — check if it's our daemon or a foreign one
-            if client.is_ours().await {
-                debug!(port = self.port, "our daemon already running");
-            } else {
-                info!(port = self.port, "foreign daemon detected on port, killing it");
-                self.kill_port_occupant().await;
-                self.wait_for_port_free().await?;
-                self.spawn_daemon().await?;
-                self.wait_for_ready(&client).await?;
-            }
+            // A daemon is already running on the port — reuse it.
+            // Both opencli and opencli-rs daemons share the same protocol
+            // (HTTP + WebSocket + Chrome extension), so either one works.
+            debug!(port = self.port, "daemon already running, reusing");
         } else {
             info!(port = self.port, "daemon not running, spawning");
             self.spawn_daemon().await?;
@@ -89,49 +83,6 @@ impl BrowserBridge {
         // We need to forget the child to prevent tokio from killing it when dropped.
         std::mem::forget(child);
         Ok(())
-    }
-
-    /// Wait for port to be free after killing the occupant.
-    async fn wait_for_port_free(&self) -> Result<(), CliError> {
-        let client = DaemonClient::new(self.port);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline {
-            if !client.is_running().await {
-                debug!(port = self.port, "port is now free");
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        warn!(port = self.port, "port still occupied after waiting, attempting spawn anyway");
-        Ok(())
-    }
-
-    /// Kill whatever process is LISTENING on our port.
-    /// Uses -sTCP:LISTEN to avoid killing ourselves (we're a client connection).
-    async fn kill_port_occupant(&self) {
-        let my_pid = std::process::id();
-
-        let output = tokio::process::Command::new("lsof")
-            .args(["-ti", &format!("tcp:{}", self.port), "-sTCP:LISTEN"])
-            .output()
-            .await;
-
-        if let Ok(output) = output {
-            let pids = String::from_utf8_lossy(&output.stdout);
-            for pid_str in pids.trim().lines() {
-                if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                    if pid == my_pid {
-                        debug!(pid = pid, "skipping self");
-                        continue;
-                    }
-                    info!(pid = pid, port = self.port, "killing foreign daemon process");
-                    let _ = tokio::process::Command::new("kill")
-                        .arg(pid.to_string())
-                        .output()
-                        .await;
-                }
-            }
-        }
     }
 
     /// Wait for the Chrome extension to connect to the daemon.

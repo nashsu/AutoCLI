@@ -130,9 +130,18 @@ async fn health_handler() -> impl IntoResponse {
 }
 
 /// GET /status — return daemon and extension status.
+/// Compatible with both opencli-rs and original opencli formats.
 async fn status_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let ext = *state.extension_connected.read().await;
-    Json(json!({ "daemon": true, "extension": ext }))
+    let pending = state.pending_commands.read().await.len();
+    Json(json!({
+        "daemon": true,
+        "extension": ext,
+        // Original opencli compatibility fields
+        "ok": true,
+        "extensionConnected": ext,
+        "pending": pending,
+    }))
 }
 
 /// POST /command — accept a command from the CLI and forward to the extension.

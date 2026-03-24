@@ -107,31 +107,18 @@ impl DaemonClient {
         false
     }
 
-    /// Check if the running daemon is ours (opencli-rs) vs a foreign one (e.g. original opencli).
-    /// Our daemon returns `{"daemon": true, ...}` on /status.
-    /// The original opencli daemon returns `{"ok": true, "extensionConnected": ...}`.
-    pub async fn is_ours(&self) -> bool {
-        let url = format!("{}/status", self.base_url);
-        match self.client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(json) = resp.json::<Value>().await {
-                    // Our daemon has "daemon" field; original has "extensionConnected"
-                    json.get("daemon").is_some()
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        }
-    }
-
     /// Check if the Chrome extension is connected to the daemon.
+    /// Compatible with both opencli-rs (`extension` field) and original opencli (`extensionConnected` field).
     pub async fn is_extension_connected(&self) -> bool {
         let url = format!("{}/status", self.base_url);
-        match self.client.get(&url).send().await {
+        // Original opencli requires X-OpenCLI header on all requests
+        match self.client.get(&url).header("X-OpenCLI", "1").send().await {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(json) = resp.json::<Value>().await {
+                    // Our format: {"extension": bool}
+                    // Original format: {"extensionConnected": bool}
                     json.get("extension")
+                        .or_else(|| json.get("extensionConnected"))
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false)
                 } else {
