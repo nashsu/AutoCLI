@@ -4,7 +4,7 @@
 
 set -e
 
-REPO="xxx/opencli-rs"
+REPO="nashsu/opencli-rs"
 INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="opencli-rs"
 
