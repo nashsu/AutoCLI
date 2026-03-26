@@ -7,6 +7,7 @@ pub mod daemon;
 pub mod bridge;
 pub mod cdp;
 pub mod browser_detection;
+pub mod browser_launcher;
 
 pub use bridge::BrowserBridge;
 pub use page::DaemonPage;
