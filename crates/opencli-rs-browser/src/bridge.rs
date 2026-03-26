@@ -89,7 +89,10 @@ impl BrowserBridge {
         }
 
         // Step 3: Wait up to 5s for extension to connect
-        if self.poll_extension(&client, EXTENSION_INITIAL_WAIT, false).await {
+        if self
+            .poll_extension(&client, EXTENSION_INITIAL_WAIT, false)
+            .await
+        {
             let page = DaemonPage::new(client, "default");
             return Ok(Arc::new(page));
         }
@@ -100,7 +103,10 @@ impl BrowserBridge {
         wake_chrome();
 
         // Step 5: Wait remaining 25s with progress
-        if self.poll_extension(&client, EXTENSION_REMAINING_WAIT, true).await {
+        if self
+            .poll_extension(&client, EXTENSION_REMAINING_WAIT, true)
+            .await
+        {
             let page = DaemonPage::new(client, "default");
             return Ok(Arc::new(page));
         }
