@@ -954,7 +954,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "opencli-rs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "clap_complete",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "opencli-rs-ai"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "opencli-rs-browser",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "opencli-rs-browser"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "opencli-rs-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -1020,7 +1020,7 @@ dependencies = [
 
 [[package]]
 name = "opencli-rs-discovery"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "opencli-rs-core",
  "opencli-rs-pipeline",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "opencli-rs-external"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "opencli-rs-core",
  "serde",
@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "opencli-rs-output"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "colored",
  "comfy-table",
@@ -1059,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "opencli-rs-pipeline"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64",
