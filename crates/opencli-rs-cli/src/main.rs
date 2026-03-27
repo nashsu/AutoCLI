@@ -116,10 +116,37 @@ fn build_cli(registry: &Registry, external_clis: &[ExternalCli]) -> Command {
                 .about("One-shot: explore + synthesize + select best adapter")
                 .arg(Arg::new("url").required(true).help("URL to generate adapter for"))
                 .arg(Arg::new("goal").long("goal").help("What you want (e.g. hot, search, trending)"))
-                .arg(Arg::new("site").long("site").help("Override site name")),
+                .arg(Arg::new("site").long("site").help("Override site name"))
+                .arg(Arg::new("ai").long("ai").action(ArgAction::SetTrue).help("Use AI (LLM) to analyze and generate adapter (requires ~/.opencli-rs/config.json)")),
         );
 
     app
+}
+
+fn save_adapter(site: &str, name: &str, yaml: &str) {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    let dir = std::path::PathBuf::from(&home)
+        .join(".opencli-rs")
+        .join("adapters")
+        .join(site);
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("{}.yaml", name));
+    match std::fs::write(&path, yaml) {
+        Ok(_) => {
+            eprintln!("✅ Generated adapter: {} {}", site, name);
+            eprintln!("   Saved to: {}", path.display());
+            eprintln!();
+            eprintln!("   Run it now:");
+            eprintln!("   opencli-rs {} {}", site, name);
+        }
+        Err(e) => {
+            eprintln!("Generated adapter but failed to save: {}", e);
+            eprintln!();
+            println!("{}", yaml);
+        }
+    }
 }
 
 fn print_error(err: &opencli_rs_core::CliError) {
@@ -293,7 +320,8 @@ async fn main() {
             "generate" => {
                 let url = site_matches.get_one::<String>("url").unwrap();
                 let goal = site_matches.get_one::<String>("goal").cloned();
-                let site = site_matches.get_one::<String>("site").cloned();
+                let _site = site_matches.get_one::<String>("site").cloned();
+                let use_ai = site_matches.get_flag("ai");
 
                 let mut bridge = opencli_rs_browser::BrowserBridge::new(
                     std::env::var("OPENCLI_DAEMON_PORT").ok()
@@ -301,37 +329,45 @@ async fn main() {
                 );
                 match bridge.connect().await {
                     Ok(page) => {
-                        let gen_result = opencli_rs_ai::generate(page.as_ref(), url, goal.as_deref().unwrap_or("")).await;
-                        let _ = page.close().await;
-                        match gen_result {
-                            Ok(candidate) => {
-                                // Save to ~/.opencli-rs/adapters/{site}/{name}.yaml
-                                let home = std::env::var("HOME")
-                                    .or_else(|_| std::env::var("USERPROFILE"))
-                                    .unwrap_or_else(|_| ".".to_string());
-                                let dir = std::path::PathBuf::from(&home)
-                                    .join(".opencli-rs")
-                                    .join("adapters")
-                                    .join(&candidate.site);
-                                let _ = std::fs::create_dir_all(&dir);
-                                let path = dir.join(format!("{}.yaml", candidate.name));
-                                match std::fs::write(&path, &candidate.yaml) {
-                                    Ok(_) => {
-                                        eprintln!("✅ Generated adapter: {} {}", candidate.site, candidate.name);
-                                        eprintln!("   Strategy: {:?}, Confidence: {:.0}%", candidate.strategy, candidate.confidence * 100.0);
-                                        eprintln!("   Saved to: {}", path.display());
-                                        eprintln!();
-                                        eprintln!("   Run it now:");
-                                        eprintln!("   opencli-rs {} {}", candidate.site, candidate.name);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Generated adapter but failed to save: {}", e);
-                                        eprintln!();
-                                        println!("{}", candidate.yaml);
-                                    }
-                                }
+                        if use_ai {
+                            // AI-powered generation
+                            let config = opencli_rs_ai::load_config();
+                            if !config.llm.is_configured() {
+                                eprintln!("❌ LLM not configured. Create ~/.opencli-rs/config.json:");
+                                eprintln!("   {{");
+                                eprintln!("     \"llm\": {{");
+                                eprintln!("       \"endpoint\": \"https://api.openai.com/v1/chat/completions\",");
+                                eprintln!("       \"apikey\": \"sk-...\",");
+                                eprintln!("       \"modelname\": \"gpt-4o\"");
+                                eprintln!("     }}");
+                                eprintln!("   }}");
+                                let _ = page.close().await;
+                                std::process::exit(1);
                             }
-                            Err(e) => { print_error(&e); std::process::exit(1); }
+
+                            let ai_result = opencli_rs_ai::generate_with_ai(
+                                page.as_ref(), url,
+                                goal.as_deref().unwrap_or("hot"),
+                                &config.llm,
+                            ).await;
+                            let _ = page.close().await;
+
+                            match ai_result {
+                                Ok((site, name, yaml)) => {
+                                    save_adapter(&site, &name, &yaml);
+                                }
+                                Err(e) => { print_error(&e); std::process::exit(1); }
+                            }
+                        } else {
+                            // Rule-based generation (existing flow)
+                            let gen_result = opencli_rs_ai::generate(page.as_ref(), url, goal.as_deref().unwrap_or("")).await;
+                            let _ = page.close().await;
+                            match gen_result {
+                                Ok(candidate) => {
+                                    save_adapter(&candidate.site, &candidate.name, &candidate.yaml);
+                                }
+                                Err(e) => { print_error(&e); std::process::exit(1); }
+                            }
                         }
                     }
                     Err(e) => { print_error(&e); std::process::exit(1); }

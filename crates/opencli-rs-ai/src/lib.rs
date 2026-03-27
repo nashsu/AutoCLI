@@ -3,6 +3,9 @@ pub mod explore;
 pub mod synthesize;
 pub mod cascade;
 pub mod generate;
+pub mod config;
+pub mod llm;
+pub mod ai_generate;
 
 pub use explore::explore;
 pub use synthesize::{synthesize, render_synthesize_summary, SynthesizeCandidateSummary, SynthesizeResult};
@@ -16,3 +19,5 @@ pub use types::{
     ExploreResult, FieldInfo, InferredCapability, RecommendedArg, ResponseAnalysis,
     StoreHint, StoreInfo, StrategyTestResult, SynthesizeOptions,
 };
+pub use config::{load_config, Config, LlmConfig};
+pub use ai_generate::generate_with_ai;

@@ -172,6 +172,14 @@ impl CliError {
         }
     }
 
+    pub fn config(msg: impl Into<String>) -> Self {
+        Self::Config {
+            message: msg.into(),
+            suggestions: vec![],
+            source: None,
+        }
+    }
+
     pub fn auth_required(msg: impl Into<String>) -> Self {
         Self::AuthRequired {
             message: msg.into(),

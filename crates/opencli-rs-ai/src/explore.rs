@@ -170,7 +170,12 @@ pub async fn explore(
     // Many SSR sites (Bilibili, Xiaohongshu) embed full page data in a global variable
     probe_initial_state(page, url, &mut network).await;
 
-    // Step 5: For JSON endpoints missing a body, re-fetch in the page context
+    // Step 4.8: Smart API discovery — find API URLs from Performance entries
+    // and re-fetch them in browser context with full credentials to get response bodies.
+    // This is much more reliable than the basic Performance API which only gives URLs.
+    smart_api_discovery(page, &mut network).await;
+
+    // Step 5: For remaining JSON endpoints missing a body, re-fetch in the page context
     re_fetch_missing_bodies(page, &mut network).await;
 
     // Step 6: Detect framework (returns Record<string, boolean>)
@@ -370,6 +375,92 @@ pub async fn explore_full(
 
 /// For JSON GET endpoints that returned 200 but have no response body,
 /// re-fetch them in the page context using a hidden iframe to get a clean fetch.
+/// Smart API discovery: find API URLs from Performance entries, re-fetch in browser
+/// with full credentials, and analyze response bodies.
+/// This replaces the unreliable Performance API approach with actual fetch + JSON parsing.
+async fn smart_api_discovery(page: &dyn IPage, network: &mut Vec<NetworkRequest>) {
+    let js = r#"(async () => {
+        const entries = performance.getEntriesByType('resource');
+        const apiUrls = entries
+            .map(e => e.name)
+            .filter(url => {
+                const lower = url.toLowerCase();
+                return (lower.includes('/api/') || lower.includes('/v1/') || lower.includes('/v2/')
+                    || lower.includes('/v3/') || lower.includes('/x/') || lower.includes('.json')
+                    || lower.includes('graphql') || lower.includes('search') || lower.includes('feed')
+                    || lower.includes('hot') || lower.includes('trending') || lower.includes('list'))
+                    && !lower.includes('.js') && !lower.includes('.css') && !lower.includes('.png')
+                    && !lower.includes('.jpg') && !lower.includes('.svg') && !lower.includes('.woff');
+            });
+
+        // Deduplicate by path (ignore volatile query params)
+        const seen = new Set();
+        const unique = apiUrls.filter(url => {
+            try {
+                const u = new URL(url);
+                const key = u.pathname;
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            } catch { return false; }
+        });
+
+        const results = [];
+        for (const url of unique.slice(0, 20)) {
+            try {
+                const resp = await fetch(url, { credentials: 'include' });
+                if (!resp.ok) continue;
+                const ct = resp.headers.get('content-type') || '';
+                if (!ct.includes('json') && !ct.includes('javascript')) continue;
+                const json = await resp.json();
+                results.push({
+                    url: url,
+                    status: resp.status,
+                    body: json,
+                });
+            } catch {}
+        }
+        return results;
+    })()"#;
+
+    match page.evaluate(js).await {
+        Ok(Value::Array(arr)) => {
+            for item in arr {
+                let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let status = item.get("status").and_then(|v| v.as_u64()).map(|s| s as u16);
+                let body = item.get("body");
+
+                if url.is_empty() { continue; }
+
+                let response_body = body.and_then(|b| {
+                    if b.is_null() { None } else { serde_json::to_string(b).ok() }
+                });
+
+                // Check if we already have this URL
+                if network.iter().any(|n| n.url == url && n.response_body.is_some()) {
+                    continue;
+                }
+
+                debug!(url = %url, has_body = response_body.is_some(), "Smart discovery found API");
+
+                network.push(NetworkRequest {
+                    url,
+                    method: "GET".to_string(),
+                    status,
+                    headers: {
+                        let mut h = HashMap::new();
+                        h.insert("content-type".to_string(), "application/json".to_string());
+                        h
+                    },
+                    response_body,
+                    ..Default::default()
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Probe .json suffix on the current URL.
 /// Sites like Reddit expose clean REST data by appending .json to page URLs.
 async fn probe_json_suffix(page: &dyn IPage, url: &str, network: &mut Vec<NetworkRequest>) {
@@ -555,8 +646,13 @@ pub(crate) fn analyze_endpoints(
 
         let pattern = url_to_pattern(&req.url);
         let key = format!("{}:{}", req.method, pattern);
-        if seen.contains_key(&key) {
-            continue;
+        // If we already have this endpoint, only skip if the existing one has a body
+        // (prefer entries with response_body over those without)
+        if let Some(existing) = seen.get(&key) {
+            if existing.response_analysis.is_some() || req.response_body.is_none() {
+                continue;
+            }
+            // Current entry has body but existing doesn't — replace it
         }
 
         // Infer content type from URL if header is missing
@@ -658,7 +754,7 @@ fn analyze_response_body(body: &str) -> (Option<ResponseAnalysis>, Vec<FieldInfo
 
     let sample = items.first().copied();
     let sample_fields = sample
-        .map(|s| flatten_fields(s, "", 2))
+        .map(|s| flatten_fields(s, "", 4))
         .unwrap_or_default();
 
     // Detect field roles
