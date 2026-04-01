@@ -716,7 +716,8 @@ async fn main() {
                                                         }
                                                         Err(e) => {
                                                             eprintln!("{}", e);
-                                                            need_ai_generate = true;
+                                                            let _ = page.close().await;
+                                                            std::process::exit(1);
                                                         }
                                                     }
                                                 } else {
