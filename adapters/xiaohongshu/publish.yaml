@@ -48,50 +48,117 @@ pipeline:
           throw new Error('Redirected away from creator center — session may have expired.');
         }
 
-        // Select 图文 tab if present
-        const allEls = document.querySelectorAll('[class*="tab"], [class*="note-type"], [class*="type-item"]');
-        for (const el of allEls) {
-          const text = el.innerText || el.textContent || '';
-          if ((text.includes('图文') || text.includes('图片')) && el.offsetParent !== null) {
-            el.click();
-            await new Promise(r => setTimeout(r, 1000));
-            break;
+        // Helper: wait for an element to appear
+        async function waitForSelector(selector, timeout = 10000) {
+          const start = Date.now();
+          while (Date.now() - start < timeout) {
+            const el = document.querySelector(selector);
+            if (el && el.offsetParent !== null) return el;
+            await new Promise(r => setTimeout(r, 300));
           }
+          return null;
         }
 
-        // Fill title
+        // Helper: find visible element by text content
+        function findByText(selector, texts) {
+          const els = document.querySelectorAll(selector);
+          for (const el of els) {
+            const t = (el.innerText || el.textContent || '').trim();
+            for (const text of texts) {
+              if (t.includes(text) && el.offsetParent !== null) return el;
+            }
+          }
+          return null;
+        }
+
+        // Step 1: Click "文字配图" or "图文" tab/button to enter the editor
+        // The creator center may show an upload dialog first — we need to select the right mode
+        const modeBtn = findByText('button, [role="button"], [class*="tab"], [class*="type-item"], [class*="note-type"], div[class*="upload"] span, div[class*="button"]', ['文字配图', '文字', '图文', '图片']);
+        if (modeBtn) {
+          modeBtn.click();
+          await new Promise(r => setTimeout(r, 2000));
+        }
+
+        // Step 2: Fill title — try multiple strategies
         const titleSelectors = [
-          'input[maxlength="20"]', 'input[class*="title"]',
-          'input[placeholder*="标题"]', 'input[placeholder*="title" i]',
+          'input[maxlength="20"]',
+          'input[class*="title"]',
+          'input[placeholder*="标题"]',
+          'input[placeholder*="title" i]',
+          'input[name*="title" i]',
+          '#title',
+          '.title-input input',
+          '[class*="titleInput"] input',
+          '[class*="title-input"] input',
         ];
         let titleFilled = false;
+
+        // Strategy A: standard input elements
         for (const sel of titleSelectors) {
           const candidates = document.querySelectorAll(sel);
           for (const el of candidates) {
             if (!el || el.offsetParent === null) continue;
             el.focus();
-            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
-              el.value = '';
-              document.execCommand('selectAll', false);
-              document.execCommand('insertText', false, title);
-              el.dispatchEvent(new Event('input', { bubbles: true }));
-            }
+            el.value = '';
+            document.execCommand('selectAll', false);
+            document.execCommand('insertText', false, title);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
             titleFilled = true;
             break;
           }
           if (titleFilled) break;
         }
+
+        // Strategy B: contenteditable title element
+        if (!titleFilled) {
+          const editables = document.querySelectorAll('[contenteditable="true"]');
+          for (const el of editables) {
+            if (!el || el.offsetParent === null) continue;
+            const placeholder = el.getAttribute('data-placeholder') || el.getAttribute('placeholder') || '';
+            const cls = el.className || '';
+            if (placeholder.includes('标题') || cls.includes('title')) {
+              el.focus();
+              el.textContent = '';
+              document.execCommand('selectAll', false);
+              document.execCommand('insertText', false, title);
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              titleFilled = true;
+              break;
+            }
+          }
+        }
+
+        // Strategy C: wait and retry once if page was still loading
+        if (!titleFilled) {
+          await new Promise(r => setTimeout(r, 2000));
+          const el = document.querySelector('input[maxlength="20"]') || document.querySelector('input[placeholder*="标题"]');
+          if (el && el.offsetParent !== null) {
+            el.focus();
+            el.value = '';
+            document.execCommand('selectAll', false);
+            document.execCommand('insertText', false, title);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            titleFilled = true;
+          }
+        }
+
         if (!titleFilled) throw new Error('Could not find title input');
         await new Promise(r => setTimeout(r, 500));
 
-        // Fill content
+        // Step 3: Fill content
         const contentSelectors = [
           '[contenteditable="true"][class*="content"]',
           '[contenteditable="true"][class*="editor"]',
+          '[contenteditable="true"][class*="ql-editor"]',
+          'div.ql-editor',
+          '[contenteditable="true"][data-placeholder*="描述"]',
+          '[contenteditable="true"][data-placeholder*="正文"]',
           '[contenteditable="true"][placeholder*="描述"]',
-          '[contenteditable="true"]:not([placeholder*="标题"])',
+          '[contenteditable="true"][placeholder*="正文"]',
         ];
         let contentFilled = false;
+
         for (const sel of contentSelectors) {
           const candidates = document.querySelectorAll(sel);
           for (const el of candidates) {
@@ -106,12 +173,53 @@ pipeline:
           }
           if (contentFilled) break;
         }
+
+        // Fallback: find any visible contenteditable that isn't the title
+        if (!contentFilled) {
+          const editables = document.querySelectorAll('[contenteditable="true"]');
+          for (const el of editables) {
+            if (!el || el.offsetParent === null) continue;
+            const placeholder = el.getAttribute('data-placeholder') || el.getAttribute('placeholder') || '';
+            const cls = el.className || '';
+            // Skip the title element
+            if (placeholder.includes('标题') || cls.includes('title')) continue;
+            el.focus();
+            el.textContent = '';
+            document.execCommand('selectAll', false);
+            document.execCommand('insertText', false, content);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            contentFilled = true;
+            break;
+          }
+        }
+
         if (!contentFilled) throw new Error('Could not find content input');
         await new Promise(r => setTimeout(r, 500));
 
-        // Publish or save draft
+        // Step 4: Add topics if provided
+        if (topics.length > 0) {
+          const topicInput = document.querySelector('input[placeholder*="话题"]') ||
+                             document.querySelector('input[placeholder*="标签"]') ||
+                             document.querySelector('input[class*="topic"]') ||
+                             document.querySelector('input[class*="tag"]');
+          if (topicInput) {
+            for (const topic of topics) {
+              topicInput.focus();
+              topicInput.value = '';
+              document.execCommand('selectAll', false);
+              document.execCommand('insertText', false, topic);
+              topicInput.dispatchEvent(new Event('input', { bubbles: true }));
+              await new Promise(r => setTimeout(r, 500));
+              // Try pressing Enter to confirm the topic
+              topicInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+              await new Promise(r => setTimeout(r, 500));
+            }
+          }
+        }
+
+        // Step 5: Publish or save draft
         const actionLabel = isDraft ? '存草稿' : '发布';
-        const buttons = document.querySelectorAll('button, [role="button"]');
+        const buttons = document.querySelectorAll('button, [role="button"], [class*="btn"], [class*="submit"]');
         let btnClicked = false;
         for (const btn of buttons) {
           const text = (btn.innerText || btn.textContent || '').trim();
