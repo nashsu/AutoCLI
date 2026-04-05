@@ -1,4 +1,5 @@
 # AutoCLI
+> 原名 **opencli-rs**，自 v0.2.4 起更名为 **AutoCLI**。
 
 **[English](README.md) | [中文](README.zh.md) | [日本語](README.ja.md)**
 

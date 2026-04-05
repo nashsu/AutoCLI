@@ -1,4 +1,5 @@
 # AutoCLI
+> 旧名 **opencli-rs**。v0.2.4 より **AutoCLI** に改名。
 
 **[English](README.md) | [中文](README.zh.md) | [日本語](README.ja.md)**
 
