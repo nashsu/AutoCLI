@@ -1,9 +1,9 @@
 // Based on OpenCLI (https://github.com/jackwener/opencli) by jackwener
 // Licensed under Apache-2.0. Modified for AutoCLI.
 /**
- * OpenCLI — Service Worker (background script).
+ * AutoCLI — Service Worker (background script).
  *
- * Connects to the opencli daemon via WebSocket, receives commands,
+ * Connects to the AutoCLI daemon via WebSocket, receives commands,
  * dispatches them to Chrome APIs (debugger/tabs/cookies), returns results.
  */
 
@@ -61,7 +61,7 @@ async function connect(): Promise<void> {
   }
 
   ws.onopen = () => {
-    console.log('[opencli] Connected to daemon');
+    console.log('[autocli] Connected to daemon');
     reconnectAttempts = 0; // Reset on successful connection
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
@@ -75,12 +75,12 @@ async function connect(): Promise<void> {
       const result = await handleCommand(command);
       ws?.send(JSON.stringify(result));
     } catch (err) {
-      console.error('[opencli] Message handling error:', err);
+      console.error('[autocli] Message handling error:', err);
     }
   };
 
   ws.onclose = () => {
-    console.log('[opencli] Disconnected from daemon');
+    console.log('[autocli] Disconnected from daemon');
     ws = null;
     scheduleReconnect();
   };
@@ -109,7 +109,7 @@ function scheduleReconnect(): void {
 }
 
 // ─── Automation window isolation ─────────────────────────────────────
-// All opencli operations happen in a dedicated Chrome window so the
+// All AutoCLI operations happen in a dedicated Chrome window so the
 // user's active browsing session is never touched.
 // The window auto-closes after 120s of idle (no commands).
 
@@ -201,7 +201,7 @@ function initialize(): void {
   chrome.alarms.create('keepalive', { periodInMinutes: 0.4 }); // ~24 seconds
   executor.registerListeners();
   connect();
-  console.log('[opencli] OpenCLI extension initialized');
+  console.log('[autocli] AutoCLI extension initialized');
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -272,10 +272,10 @@ async function resolveTabId(tabId: number | undefined, workspace: string): Promi
       const tab = await chrome.tabs.get(tabId);
       if (isDebuggableUrl(tab.url)) return tabId;
       // Tab exists but URL is not debuggable — fall through to auto-resolve
-      console.warn(`[opencli] Tab ${tabId} URL is not debuggable (${tab.url}), re-resolving`);
+      console.warn(`[autocli] Tab ${tabId} URL is not debuggable (${tab.url}), re-resolving`);
     } catch {
       // Tab was closed — fall through to auto-resolve
-      console.warn(`[opencli] Tab ${tabId} no longer exists, re-resolving`);
+      console.warn(`[autocli] Tab ${tabId} no longer exists, re-resolving`);
     }
   }
 
@@ -296,7 +296,7 @@ async function resolveTabId(tabId: number | undefined, workspace: string): Promi
     try {
       const updated = await chrome.tabs.get(reuseTab.id);
       if (isDebuggableUrl(updated.url)) return reuseTab.id;
-      console.warn(`[opencli] data: URI was intercepted (${updated.url}), creating fresh tab`);
+      console.warn(`[autocli] data: URI was intercepted (${updated.url}), creating fresh tab`);
     } catch {
       // Tab was closed during navigation
     }
@@ -391,7 +391,7 @@ async function handleNavigate(cmd: Command, workspace: string): Promise<Result> 
     setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(listener);
       timedOut = true;
-      console.warn(`[opencli] Navigate to ${targetUrl} timed out after 15s`);
+      console.warn(`[autocli] Navigate to ${targetUrl} timed out after 15s`);
       resolve();
     }, 15000);
   });
