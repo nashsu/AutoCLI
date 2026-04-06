@@ -8,7 +8,7 @@
  */
 
 import type { Command, Result } from './protocol';
-import { DAEMON_WS_URL, WS_RECONNECT_BASE_DELAY, WS_RECONNECT_MAX_DELAY } from './protocol';
+import { DAEMON_WS_URL, DAEMON_HTTP_URL, WS_RECONNECT_BASE_DELAY, WS_RECONNECT_MAX_DELAY } from './protocol';
 import * as executor from './cdp';
 
 let ws: WebSocket | null = null;
@@ -36,8 +36,22 @@ console.error = (...args: unknown[]) => { _origError(...args); forwardLog('error
 
 // ─── WebSocket connection ────────────────────────────────────────────
 
-function connect(): void {
+/**
+ * Probe the daemon via its /ping HTTP endpoint before attempting a WebSocket
+ * connection.  fetch() failures are silently catchable; new WebSocket() is not
+ * — Chrome logs ERR_CONNECTION_REFUSED to the extension error page before any
+ * JS handler can intercept it.  By gating on the probe, we avoid noisy errors
+ * when the daemon is simply not running yet.
+ */
+async function connect(): Promise<void> {
   if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return;
+
+  try {
+    const res = await fetch(`${DAEMON_HTTP_URL}/ping`, { signal: AbortSignal.timeout(1000) });
+    if (!res.ok) return; // unexpected response — not our daemon
+  } catch {
+    return; // daemon not running — skip WebSocket to avoid console noise
+  }
 
   try {
     ws = new WebSocket(DAEMON_WS_URL);
@@ -76,10 +90,17 @@ function connect(): void {
   };
 }
 
+/**
+ * After MAX_EAGER_ATTEMPTS (reaching 60s backoff), stop scheduling reconnects.
+ * The keepalive alarm (~24s) will still call connect() periodically, but at a
+ * much lower frequency — reducing console noise when the daemon is not running.
+ */
+const MAX_EAGER_ATTEMPTS = 6; // 2s, 4s, 8s, 16s, 32s, 60s — then stop
+
 function scheduleReconnect(): void {
   if (reconnectTimer) return;
   reconnectAttempts++;
-  // Exponential backoff: 2s, 4s, 8s, 16s, ..., capped at 60s
+  if (reconnectAttempts > MAX_EAGER_ATTEMPTS) return; // let keepalive alarm handle it
   const delay = Math.min(WS_RECONNECT_BASE_DELAY * Math.pow(2, reconnectAttempts - 1), WS_RECONNECT_MAX_DELAY);
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
