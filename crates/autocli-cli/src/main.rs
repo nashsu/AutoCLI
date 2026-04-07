@@ -5,21 +5,38 @@ mod i18n;
 
 use i18n::t;
 
-use clap::{Arg, ArgAction, Command};
-use clap_complete::Shell;
 use autocli_core::Registry;
-use serde_json::Value;
 use autocli_discovery::{discover_builtin_adapters, discover_user_adapters};
-use autocli_external::{load_external_clis, ExternalCli};
+use autocli_external::{is_binary_installed, load_external_clis, upsert_external_cli, ExternalCli};
 use autocli_output::format::{OutputFormat, RenderOptions};
 use autocli_output::render;
+use clap::{Arg, ArgAction, Command};
+use clap_complete::Shell;
+use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::str::FromStr;
 use tracing_subscriber::EnvFilter;
 
 use crate::args::coerce_and_validate_args;
 use crate::commands::{completion, doctor};
 use crate::execution::execute_command;
+
+const UTILITY_SUBCOMMANDS: &[&str] = &[
+    "auth",
+    "cascade",
+    "completion",
+    "doctor",
+    "explore",
+    "generate",
+    "list",
+    "register",
+    "search",
+];
+
+fn subcommand_name_conflicts(name: &str, registry: &Registry) -> bool {
+    registry.list_sites().iter().any(|site| *site == name) || UTILITY_SUBCOMMANDS.contains(&name)
+}
 
 fn build_cli(registry: &Registry, external_clis: &[ExternalCli]) -> Command {
     let mut app = Command::new("autocli")
@@ -79,6 +96,10 @@ fn build_cli(registry: &Registry, external_clis: &[ExternalCli]) -> Command {
 
     // Add external CLI subcommands
     for ext in external_clis {
+        if subcommand_name_conflicts(ext.name.as_str(), registry) {
+            tracing::warn!(name = %ext.name, "Skipping external CLI with reserved name");
+            continue;
+        }
         app = app.subcommand(
             Command::new(ext.name.clone())
                 .about(ext.description.clone())
@@ -88,6 +109,22 @@ fn build_cli(registry: &Registry, external_clis: &[ExternalCli]) -> Command {
 
     // Built-in utility subcommands
     app = app
+        .subcommand(Command::new("list").about("List discovered adapters and registered external CLIs"))
+        .subcommand(
+            Command::new("register")
+                .about("Register an external CLI so AutoCLI can expose it to agents")
+                .arg(Arg::new("name").required(true).help("Subcommand name to expose"))
+                .arg(Arg::new("binary").long("binary").short('b').help("Binary name or absolute path to execute"))
+                .arg(Arg::new("description").long("description").short('d').help("Human-readable description"))
+                .arg(Arg::new("homepage").long("homepage").help("Project homepage or docs URL"))
+                .arg(
+                    Arg::new("tag")
+                        .long("tag")
+                        .short('t')
+                        .action(ArgAction::Append)
+                        .help("Discovery tag (repeatable)"),
+                ),
+        )
         .subcommand(Command::new("doctor").about("Run diagnostics checks"))
         .subcommand(
             Command::new("completion")
@@ -150,20 +187,34 @@ fn migrate_legacy_config() {
 
     // Copy contents to new directory
     if let Err(e) = copy_dir_recursive(&old_dir, &new_dir) {
-        eprintln!("{}{}", t("⚠️  配置迁移失败: ", "⚠️  Config migration failed: "), e);
+        eprintln!(
+            "{}{}",
+            t("⚠️  配置迁移失败: ", "⚠️  Config migration failed: "),
+            e
+        );
         return;
     }
 
     // Remove old directory
     if let Err(e) = std::fs::remove_dir_all(&old_dir) {
-        eprintln!("{}{}", t("⚠️  无法删除旧配置目录: ", "⚠️  Cannot remove old config dir: "), e);
+        eprintln!(
+            "{}{}",
+            t(
+                "⚠️  无法删除旧配置目录: ",
+                "⚠️  Cannot remove old config dir: "
+            ),
+            e
+        );
         return;
     }
 
-    eprintln!("{}", t(
-        "✅ 已将配置从 ~/.opencli-rs 迁移到 ~/.autocli",
-        "✅ Migrated config from ~/.opencli-rs to ~/.autocli"
-    ));
+    eprintln!(
+        "{}",
+        t(
+            "✅ 已将配置从 ~/.opencli-rs 迁移到 ~/.autocli",
+            "✅ Migrated config from ~/.opencli-rs to ~/.autocli"
+        )
+    );
 }
 
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
@@ -196,18 +247,178 @@ fn save_adapter(site: &str, name: &str, yaml: &str) {
     let path = dir.join(format!("{}.yaml", name));
     match std::fs::write(&path, yaml) {
         Ok(_) => {
-            eprintln!("{} {} {}", t("✅ 已生成配置:", "✅ Generated adapter:"), site, name);
+            eprintln!(
+                "{} {} {}",
+                t("✅ 已生成配置:", "✅ Generated adapter:"),
+                site,
+                name
+            );
             eprintln!("   {}{}", t("保存到: ", "Saved to: "), path.display());
             eprintln!();
             eprintln!("   {}", t("运行命令:", "Run it now:"));
             eprintln!("   autocli {} {}", site, name);
         }
         Err(e) => {
-            eprintln!("{}{}", t("生成成功但保存失败: ", "Generated adapter but failed to save: "), e);
+            eprintln!(
+                "{}{}",
+                t(
+                    "生成成功但保存失败: ",
+                    "Generated adapter but failed to save: "
+                ),
+                e
+            );
             eprintln!();
             println!("{}", yaml);
         }
     }
+}
+
+fn render_inventory(
+    output_format: OutputFormat,
+    registry: &Registry,
+    external_clis: &[ExternalCli],
+) {
+    let external_count = external_clis
+        .iter()
+        .filter(|cli| !subcommand_name_conflicts(cli.name.as_str(), registry))
+        .count();
+    let mut rows: Vec<Value> = registry
+        .all_commands()
+        .into_iter()
+        .map(|cmd| {
+            json!({
+                "kind": "adapter",
+                "site": cmd.site.clone(),
+                "command": cmd.name.clone(),
+                "mode": if cmd.needs_browser() { format!("browser ({})", cmd.strategy) } else { "public".to_string() },
+                "description": cmd.description.clone(),
+                "binary": "",
+                "tags": "",
+            })
+        })
+        .collect();
+
+    rows.extend(
+        external_clis
+            .iter()
+            .filter(|cli| !subcommand_name_conflicts(cli.name.as_str(), registry))
+            .map(|cli| {
+                json!({
+                    "kind": "external",
+                    "site": cli.name.clone(),
+                    "command": "*",
+                    "mode": "passthrough",
+                    "description": cli.description.clone(),
+                    "binary": cli.binary.clone(),
+                    "tags": cli.tags.join(","),
+                })
+            }),
+    );
+
+    let data = Value::Array(rows);
+    let output = render(
+        &data,
+        &RenderOptions {
+            format: output_format,
+            columns: Some(vec![
+                "kind".to_string(),
+                "site".to_string(),
+                "command".to_string(),
+                "mode".to_string(),
+                "description".to_string(),
+                "binary".to_string(),
+                "tags".to_string(),
+            ]),
+            title: Some("Available tools".to_string()),
+            elapsed: None,
+            source: Some("autocli list".to_string()),
+            footer_extra: Some(format!(
+                "{} adapters, {} external CLIs",
+                registry.command_count(),
+                external_count
+            )),
+        },
+    );
+    println!("{}", output);
+}
+
+fn validate_register_name(
+    name: &str,
+    registry: &Registry,
+    external_clis: &[ExternalCli],
+) -> Result<(), autocli_core::CliError> {
+    if name.trim().is_empty() {
+        return Err(autocli_core::CliError::Argument {
+            message: "External CLI name cannot be empty".to_string(),
+            suggestions: vec![],
+        });
+    }
+
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(autocli_core::CliError::Argument {
+            message: format!(
+                "External CLI name '{}' must use only letters, numbers, '-' or '_'",
+                name
+            ),
+            suggestions: vec![],
+        });
+    }
+
+    if subcommand_name_conflicts(name, registry) {
+        return Err(autocli_core::CliError::Argument {
+            message: format!(
+                "'{}' is already reserved by an adapter site or built-in subcommand",
+                name
+            ),
+            suggestions: vec![
+                "Choose a different external CLI name".to_string(),
+                "Avoid collisions with list/register/doctor or adapter site names".to_string(),
+            ],
+        });
+    }
+
+    if let Some(existing) = external_clis.iter().find(|existing| existing.name == name) {
+        if existing.binary.is_empty() {
+            return Err(autocli_core::CliError::Argument {
+                message: format!("'{}' is already registered with an invalid binary", name),
+                suggestions: vec![
+                    "Repair the existing entry in ~/.autocli/external-clis.yaml".to_string()
+                ],
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_binary_reference(binary: &str) -> Result<(), autocli_core::CliError> {
+    let looks_like_path = binary.contains('/')
+        || binary.contains('\\')
+        || binary.starts_with('.')
+        || binary.starts_with('~');
+
+    if looks_like_path {
+        if Path::new(binary).exists() {
+            return Ok(());
+        }
+    } else if is_binary_installed(binary) {
+        return Ok(());
+    }
+
+    Err(autocli_core::CliError::Argument {
+        message: format!("Binary '{}' was not found", binary),
+        suggestions: vec![
+            "Install the CLI first, or pass --binary with an absolute path".to_string(),
+            format!("Checked reference: {}", binary),
+        ],
+    })
+}
+
+fn default_external_description(name: &str) -> String {
+    format!("User-registered external CLI for {}", name)
 }
 
 const TOKEN_URL: &str = "https://autocli.ai/get-token";
@@ -218,16 +429,22 @@ fn require_token() -> String {
     match config.autocli_token {
         Some(t) if !t.is_empty() => t,
         _ => {
-            eprintln!("{}", t(
-                "❌ 未认证，请先登录获取 Token",
-                "❌ Not authenticated. Please login to get your token"
-            ));
+            eprintln!(
+                "{}",
+                t(
+                    "❌ 未认证，请先登录获取 Token",
+                    "❌ Not authenticated. Please login to get your token"
+                )
+            );
             eprintln!("   {}", TOKEN_URL);
             eprintln!();
-            eprintln!("   {}", t(
-                "获取 Token 后运行: autocli auth",
-                "After getting your token, run: autocli auth"
-            ));
+            eprintln!(
+                "   {}",
+                t(
+                    "获取 Token 后运行: autocli auth",
+                    "After getting your token, run: autocli auth"
+                )
+            );
             std::process::exit(1);
         }
     }
@@ -235,16 +452,22 @@ fn require_token() -> String {
 
 /// Print token invalid/expired message and exit.
 fn token_expired_exit() -> ! {
-    eprintln!("{}", t(
-        "❌ Token 无效或已过期，请重新获取",
-        "❌ Token is invalid or expired. Please get a new one"
-    ));
+    eprintln!(
+        "{}",
+        t(
+            "❌ Token 无效或已过期，请重新获取",
+            "❌ Token is invalid or expired. Please get a new one"
+        )
+    );
     eprintln!("   {}", TOKEN_URL);
     eprintln!();
-    eprintln!("   {}", t(
-        "获取新 Token 后运行: autocli auth",
-        "After getting a new token, run: autocli auth"
-    ));
+    eprintln!(
+        "   {}",
+        t(
+            "获取新 Token 后运行: autocli auth",
+            "After getting a new token, run: autocli auth"
+        )
+    );
     std::process::exit(1);
 }
 
@@ -264,7 +487,13 @@ async fn search_existing_adapters(url: &str, token: &str) -> Result<Vec<AdapterM
     let pattern = autocli_ai::url_to_pattern(url);
     let search_url = autocli_ai::search_url(&pattern);
 
-    eprintln!("{}", t("🔍 搜索已有配置...", "🔍 Searching for existing adapters..."));
+    eprintln!(
+        "{}",
+        t(
+            "🔍 搜索已有配置...",
+            "🔍 Searching for existing adapters..."
+        )
+    );
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -277,36 +506,84 @@ async fn search_existing_adapters(url: &str, token: &str) -> Result<Vec<AdapterM
         .header("User-Agent", autocli_ai::user_agent())
         .send()
         .await
-        .map_err(|_| t("❌ 服务器连接失败，请稍后再试", "❌ Server connection failed, please try again later").to_string())?;
+        .map_err(|_| {
+            t(
+                "❌ 服务器连接失败，请稍后再试",
+                "❌ Server connection failed, please try again later",
+            )
+            .to_string()
+        })?;
 
     if resp.status().as_u16() == 403 {
         token_expired_exit();
     }
     if !resp.status().is_success() {
-        return Err(format!("{}{}", t("❌ 服务器返回错误: ", "❌ Server error: "), resp.status()));
+        return Err(format!(
+            "{}{}",
+            t("❌ 服务器返回错误: ", "❌ Server error: "),
+            resp.status()
+        ));
     }
 
-    let body: serde_json::Value = resp.json().await
+    let body: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-    let matches = body.get("matches")
+    let matches = body
+        .get("matches")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
 
     let mut results = Vec::new();
     for m in &matches {
-        let match_type = m.get("match_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let site_name = m.get("site").and_then(|s| s.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let cmd_name = m.get("command").and_then(|c| c.get("cmd_name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let description = m.get("command").and_then(|c| c.get("description")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let author = m.get("command").and_then(|c| c.get("author")).and_then(|v| v.as_str())
+        let match_type = m
+            .get("match_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let site_name = m
+            .get("site")
+            .and_then(|s| s.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let cmd_name = m
+            .get("command")
+            .and_then(|c| c.get("cmd_name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let description = m
+            .get("command")
+            .and_then(|c| c.get("description"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let author = m
+            .get("command")
+            .and_then(|c| c.get("author"))
+            .and_then(|v| v.as_str())
             .or_else(|| m.get("author").and_then(|v| v.as_str()))
-            .unwrap_or("").to_string();
-        let command_uuid = m.get("command").and_then(|c| c.get("uuid")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            .unwrap_or("")
+            .to_string();
+        let command_uuid = m
+            .get("command")
+            .and_then(|c| c.get("uuid"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         if !command_uuid.is_empty() {
-            results.push(AdapterMatch { match_type, site_name, cmd_name, description, author, command_uuid });
+            results.push(AdapterMatch {
+                match_type,
+                site_name,
+                cmd_name,
+                description,
+                author,
+                command_uuid,
+            });
         }
     }
 
@@ -328,16 +605,28 @@ async fn fetch_adapter_config(command_uuid: &str, token: &str) -> Result<String,
         .header("User-Agent", autocli_ai::user_agent())
         .send()
         .await
-        .map_err(|_| t("❌ 服务器连接失败，请稍后再试", "❌ Server connection failed, please try again later").to_string())?;
+        .map_err(|_| {
+            t(
+                "❌ 服务器连接失败，请稍后再试",
+                "❌ Server connection failed, please try again later",
+            )
+            .to_string()
+        })?;
 
     if resp.status().as_u16() == 403 {
         token_expired_exit();
     }
     if !resp.status().is_success() {
-        return Err(format!("{}{}", t("❌ 获取配置失败: ", "❌ Failed to fetch config: "), resp.status()));
+        return Err(format!(
+            "{}{}",
+            t("❌ 获取配置失败: ", "❌ Failed to fetch config: "),
+            resp.status()
+        ));
     }
 
-    let body: serde_json::Value = resp.json().await
+    let body: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
     body.get("config")
@@ -358,7 +647,10 @@ async fn upload_adapter(yaml: &str) {
         .build()
     {
         Ok(c) => c,
-        Err(e) => { eprintln!("❌ Failed to create HTTP client: {}", e); return; }
+        Err(e) => {
+            eprintln!("❌ Failed to create HTTP client: {}", e);
+            return;
+        }
     };
 
     let body = serde_json::json!({ "config": yaml });
@@ -373,16 +665,26 @@ async fn upload_adapter(yaml: &str) {
     {
         Ok(resp) => {
             if resp.status().is_success() {
-                eprintln!("{}", t("✅ 配置上传成功", "✅ Adapter uploaded successfully"));
+                eprintln!(
+                    "{}",
+                    t("✅ 配置上传成功", "✅ Adapter uploaded successfully")
+                );
             } else if resp.status().as_u16() == 403 {
                 token_expired_exit();
             } else {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                eprintln!("{}{}: {}", t("❌ 上传失败 ", "❌ Upload failed "), status, &body[..body.len().min(200)]);
+                eprintln!(
+                    "{}{}: {}",
+                    t("❌ 上传失败 ", "❌ Upload failed "),
+                    status,
+                    &body[..body.len().min(200)]
+                );
             }
         }
-        Err(e) => { eprintln!("{}{}", t("❌ 上传失败: ", "❌ Upload failed: "), e); }
+        Err(e) => {
+            eprintln!("{}{}", t("❌ 上传失败: ", "❌ Upload failed: "), e);
+        }
     }
 }
 
@@ -404,15 +706,13 @@ async fn main() {
 
     // 1. Initialize tracing
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| {
-                if std::env::var("AUTOCLI_VERBOSE").is_ok() {
-                    EnvFilter::new("debug")
-                } else {
-                    EnvFilter::new("warn")
-                }
-            }),
-        )
+        .with_env_filter(EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| {
+            if std::env::var("AUTOCLI_VERBOSE").is_ok() {
+                EnvFilter::new("debug")
+            } else {
+                EnvFilter::new("warn")
+            }
+        }))
         .init();
 
     // Check for --daemon flag (used by BrowserBridge to spawn daemon as subprocess)
@@ -480,6 +780,65 @@ async fn main() {
     if let Some((site_name, site_matches)) = matches.subcommand() {
         // Handle built-in utility subcommands
         match site_name {
+            "list" => {
+                render_inventory(output_format, &registry, &external_clis);
+                return;
+            }
+            "register" => {
+                let name = site_matches
+                    .get_one::<String>("name")
+                    .unwrap()
+                    .trim()
+                    .to_string();
+                if let Err(e) = validate_register_name(&name, &registry, &external_clis) {
+                    print_error(&e);
+                    std::process::exit(1);
+                }
+
+                let binary = site_matches
+                    .get_one::<String>("binary")
+                    .cloned()
+                    .unwrap_or_else(|| name.clone());
+                if let Err(e) = validate_binary_reference(&binary) {
+                    print_error(&e);
+                    std::process::exit(1);
+                }
+
+                let description = site_matches
+                    .get_one::<String>("description")
+                    .cloned()
+                    .unwrap_or_else(|| default_external_description(&name));
+                let homepage = site_matches.get_one::<String>("homepage").cloned();
+                let tags = site_matches
+                    .get_many::<String>("tag")
+                    .map(|values| values.cloned().collect::<Vec<_>>())
+                    .filter(|values| !values.is_empty())
+                    .unwrap_or_else(|| vec!["user".to_string(), "local".to_string()]);
+
+                let cli = ExternalCli {
+                    name: name.clone(),
+                    binary,
+                    description,
+                    homepage,
+                    tags,
+                    install: HashMap::new(),
+                };
+
+                match upsert_external_cli(cli) {
+                    Ok((path, updated)) => {
+                        if updated {
+                            println!("Updated external CLI '{}' in {}", name, path.display());
+                        } else {
+                            println!("Registered external CLI '{}' in {}", name, path.display());
+                        }
+                    }
+                    Err(e) => {
+                        print_error(&e);
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
             "doctor" => {
                 doctor::run_doctor().await;
                 return;
@@ -504,30 +863,34 @@ async fn main() {
 
                 match search_existing_adapters(&url, &token).await {
                     Ok(matches) if !matches.is_empty() => {
-                        let options: Vec<String> = matches.iter().map(|m| {
-                            let tag = match m.match_type.as_str() {
-                                "exact" => "[exact]  ",
-                                "partial" => "[partial]",
-                                "domain" => "[domain] ",
-                                _ => "[other]  ",
-                            };
-                            let desc = if m.description.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" - {}", m.description)
-                            };
-                            let author = if m.author.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" (by {})", m.author)
-                            };
-                            format!("{} {} {}{}{}", tag, m.site_name, m.cmd_name, author, desc)
-                        }).collect();
+                        let options: Vec<String> = matches
+                            .iter()
+                            .map(|m| {
+                                let tag = match m.match_type.as_str() {
+                                    "exact" => "[exact]  ",
+                                    "partial" => "[partial]",
+                                    "domain" => "[domain] ",
+                                    _ => "[other]  ",
+                                };
+                                let desc = if m.description.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" - {}", m.description)
+                                };
+                                let author = if m.author.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" (by {})", m.author)
+                                };
+                                format!("{} {} {}{}{}", tag, m.site_name, m.cmd_name, author, desc)
+                            })
+                            .collect();
 
                         let selection = inquire::Select::new(
                             t("找到以下配置，请选择:", "Adapters found, please select:"),
                             options,
-                        ).prompt();
+                        )
+                        .prompt();
 
                         match selection {
                             Ok(chosen) => {
@@ -536,15 +899,20 @@ async fn main() {
                                 });
                                 if let Some(i) = idx {
                                     let m = &matches[i];
-                                    eprintln!("{}", t("📥 正在下载配置...", "📥 Downloading config..."));
+                                    eprintln!(
+                                        "{}",
+                                        t("📥 正在下载配置...", "📥 Downloading config...")
+                                    );
                                     match fetch_adapter_config(&m.command_uuid, &token).await {
                                         Ok(yaml) => {
-                                            let yaml_site = yaml.lines()
+                                            let yaml_site = yaml
+                                                .lines()
                                                 .find(|l| l.starts_with("site:"))
                                                 .and_then(|l| l.strip_prefix("site:"))
                                                 .map(|s| s.trim().trim_matches('"').to_string())
                                                 .unwrap_or_else(|| m.site_name.clone());
-                                            let yaml_name = yaml.lines()
+                                            let yaml_name = yaml
+                                                .lines()
                                                 .find(|l| l.starts_with("name:"))
                                                 .and_then(|l| l.strip_prefix("name:"))
                                                 .map(|s| s.trim().trim_matches('"').to_string())
@@ -561,7 +929,10 @@ async fn main() {
                         }
                     }
                     Ok(_) => {
-                        eprintln!("{}", t("📭 未找到匹配的配置", "📭 No matching adapters found"));
+                        eprintln!(
+                            "{}",
+                            t("📭 未找到匹配的配置", "📭 No matching adapters found")
+                        );
                     }
                     Err(e) => {
                         eprintln!("{}", e);
@@ -573,10 +944,13 @@ async fn main() {
             "auth" => {
                 // Open browser to get token
                 let token_url = "https://autocli.ai/get-token";
-                eprintln!("{}", t(
-                    "🔑 请在浏览器中获取 Token:",
-                    "🔑 Get your token from the browser:"
-                ));
+                eprintln!(
+                    "{}",
+                    t(
+                        "🔑 请在浏览器中获取 Token:",
+                        "🔑 Get your token from the browser:"
+                    )
+                );
                 eprintln!("   {}", token_url);
                 eprintln!();
 
@@ -584,15 +958,19 @@ async fn main() {
                 let _ = if cfg!(target_os = "macos") {
                     std::process::Command::new("open").arg(token_url).spawn()
                 } else if cfg!(target_os = "windows") {
-                    std::process::Command::new("cmd").args(["/C", "start", token_url]).spawn()
+                    std::process::Command::new("cmd")
+                        .args(["/C", "start", token_url])
+                        .spawn()
                 } else {
-                    std::process::Command::new("xdg-open").arg(token_url).spawn()
+                    std::process::Command::new("xdg-open")
+                        .arg(token_url)
+                        .spawn()
                 };
 
                 // Token input loop with verification
                 loop {
-                    let input = inquire::Text::new(t("请输入 Token:", "Enter your token:"))
-                        .prompt();
+                    let input =
+                        inquire::Text::new(t("请输入 Token:", "Enter your token:")).prompt();
 
                     let token = match input {
                         Ok(t) => t.trim().to_string(),
@@ -632,16 +1010,30 @@ async fn main() {
                                 config.autocli_token = Some(token);
                                 match autocli_ai::save_config(&config) {
                                     Ok(_) => {
-                                        eprintln!("{}{}", t("✅ Token 已保存到 ", "✅ Token saved to "), autocli_ai::config::config_path().display());
+                                        eprintln!(
+                                            "{}{}",
+                                            t("✅ Token 已保存到 ", "✅ Token saved to "),
+                                            autocli_ai::config::config_path().display()
+                                        );
                                     }
                                     Err(e) => {
-                                        eprintln!("{}{}", t("❌ Token 保存失败: ", "❌ Failed to save token: "), e);
+                                        eprintln!(
+                                            "{}{}",
+                                            t("❌ Token 保存失败: ", "❌ Failed to save token: "),
+                                            e
+                                        );
                                         std::process::exit(1);
                                     }
                                 }
                                 break;
                             } else {
-                                eprintln!("{}", t("❌ Token 无效，请重新输入", "❌ Invalid token, please try again"));
+                                eprintln!(
+                                    "{}",
+                                    t(
+                                        "❌ Token 无效，请重新输入",
+                                        "❌ Invalid token, please try again"
+                                    )
+                                );
                                 continue;
                             }
                         }
@@ -657,16 +1049,21 @@ async fn main() {
                 let url = site_matches.get_one::<String>("url").unwrap();
                 let site = site_matches.get_one::<String>("site").cloned();
                 let goal = site_matches.get_one::<String>("goal").cloned();
-                let wait: u64 = site_matches.get_one::<String>("wait")
-                    .and_then(|s| s.parse().ok()).unwrap_or(3);
+                let wait: u64 = site_matches
+                    .get_one::<String>("wait")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3);
                 let auto_fuzz = site_matches.get_flag("auto");
-                let click_labels: Vec<String> = site_matches.get_one::<String>("click")
+                let click_labels: Vec<String> = site_matches
+                    .get_one::<String>("click")
                     .map(|s| s.split(',').map(|l| l.trim().to_string()).collect())
                     .unwrap_or_default();
 
                 let mut bridge = autocli_browser::BrowserBridge::new(
-                    std::env::var("AUTOCLI_DAEMON_PORT").ok()
-                        .and_then(|s| s.parse().ok()).unwrap_or(19825),
+                    std::env::var("AUTOCLI_DAEMON_PORT")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(19825),
                 );
                 match bridge.connect().await {
                     Ok(page) => {
@@ -684,13 +1081,20 @@ async fn main() {
                         let _ = page.close().await;
                         match result {
                             Ok(manifest) => {
-                                let output = serde_json::to_string_pretty(&manifest).unwrap_or_default();
+                                let output =
+                                    serde_json::to_string_pretty(&manifest).unwrap_or_default();
                                 println!("{}", output);
                             }
-                            Err(e) => { print_error(&e); std::process::exit(1); }
+                            Err(e) => {
+                                print_error(&e);
+                                std::process::exit(1);
+                            }
                         }
                     }
-                    Err(e) => { print_error(&e); std::process::exit(1); }
+                    Err(e) => {
+                        print_error(&e);
+                        std::process::exit(1);
+                    }
                 }
                 return;
             }
@@ -698,8 +1102,10 @@ async fn main() {
                 let url = site_matches.get_one::<String>("url").unwrap();
 
                 let mut bridge = autocli_browser::BrowserBridge::new(
-                    std::env::var("AUTOCLI_DAEMON_PORT").ok()
-                        .and_then(|s| s.parse().ok()).unwrap_or(19825),
+                    std::env::var("AUTOCLI_DAEMON_PORT")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(19825),
                 );
                 match bridge.connect().await {
                     Ok(page) => {
@@ -710,10 +1116,16 @@ async fn main() {
                                 let output = serde_json::to_string_pretty(&r).unwrap_or_default();
                                 println!("{}", output);
                             }
-                            Err(e) => { print_error(&e); std::process::exit(1); }
+                            Err(e) => {
+                                print_error(&e);
+                                std::process::exit(1);
+                            }
                         }
                     }
-                    Err(e) => { print_error(&e); std::process::exit(1); }
+                    Err(e) => {
+                        print_error(&e);
+                        std::process::exit(1);
+                    }
                 }
                 return;
             }
@@ -724,8 +1136,10 @@ async fn main() {
                 let use_ai = site_matches.get_flag("ai");
 
                 let mut bridge = autocli_browser::BrowserBridge::new(
-                    std::env::var("AUTOCLI_DAEMON_PORT").ok()
-                        .and_then(|s| s.parse().ok()).unwrap_or(19825),
+                    std::env::var("AUTOCLI_DAEMON_PORT")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(19825),
                 );
                 match bridge.connect().await {
                     Ok(page) => {
@@ -738,32 +1152,44 @@ async fn main() {
                             match search_existing_adapters(url, &token).await {
                                 Ok(matches) if !matches.is_empty() => {
                                     // Build TUI selection list
-                                    let mut options: Vec<String> = matches.iter().map(|m| {
-                                        let tag = match m.match_type.as_str() {
-                                            "exact" => "[exact]  ",
-                                            "partial" => "[partial]",
-                                            "domain" => "[domain] ",
-                                            _ => "[other]  ",
-                                        };
-                                        let desc = if m.description.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!(" - {}", m.description)
-                                        };
-                                        let author = if m.author.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!(" (by {})", m.author)
-                                        };
-                                        format!("{} {} {}{}{}", tag, m.site_name, m.cmd_name, author, desc)
-                                    }).collect();
-                                    let regenerate_label = t("🔄 重新生成 (使用 AI 分析)", "🔄 Regenerate (using AI)").to_string();
+                                    let mut options: Vec<String> = matches
+                                        .iter()
+                                        .map(|m| {
+                                            let tag = match m.match_type.as_str() {
+                                                "exact" => "[exact]  ",
+                                                "partial" => "[partial]",
+                                                "domain" => "[domain] ",
+                                                _ => "[other]  ",
+                                            };
+                                            let desc = if m.description.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!(" - {}", m.description)
+                                            };
+                                            let author = if m.author.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!(" (by {})", m.author)
+                                            };
+                                            format!(
+                                                "{} {} {}{}{}",
+                                                tag, m.site_name, m.cmd_name, author, desc
+                                            )
+                                        })
+                                        .collect();
+                                    let regenerate_label =
+                                        t("🔄 重新生成 (使用 AI 分析)", "🔄 Regenerate (using AI)")
+                                            .to_string();
                                     options.push(regenerate_label.clone());
 
                                     let selection = inquire::Select::new(
-                                        t("找到以下已有配置，请选择:", "Existing adapters found, please select:"),
+                                        t(
+                                            "找到以下已有配置，请选择:",
+                                            "Existing adapters found, please select:",
+                                        ),
                                         options,
-                                    ).prompt();
+                                    )
+                                    .prompt();
 
                                     match selection {
                                         Ok(chosen) => {
@@ -772,25 +1198,57 @@ async fn main() {
                                             } else {
                                                 // Find the matching config
                                                 let idx = matches.iter().position(|m| {
-                                                    chosen.contains(&m.cmd_name) && chosen.contains(&m.site_name)
+                                                    chosen.contains(&m.cmd_name)
+                                                        && chosen.contains(&m.site_name)
                                                 });
                                                 if let Some(i) = idx {
                                                     let m = &matches[i];
                                                     // Extract site and name from YAML config content, not server's display name
-                                                    eprintln!("{}", t("📥 正在下载配置...", "📥 Downloading config..."));
-                                                    match fetch_adapter_config(&m.command_uuid, &token).await {
+                                                    eprintln!(
+                                                        "{}",
+                                                        t(
+                                                            "📥 正在下载配置...",
+                                                            "📥 Downloading config..."
+                                                        )
+                                                    );
+                                                    match fetch_adapter_config(
+                                                        &m.command_uuid,
+                                                        &token,
+                                                    )
+                                                    .await
+                                                    {
                                                         Ok(yaml) => {
-                                                            let yaml_site = yaml.lines()
+                                                            let yaml_site = yaml
+                                                                .lines()
                                                                 .find(|l| l.starts_with("site:"))
-                                                                .and_then(|l| l.strip_prefix("site:"))
-                                                                .map(|s| s.trim().trim_matches('"').to_string())
-                                                                .unwrap_or_else(|| m.site_name.clone());
-                                                            let yaml_name = yaml.lines()
+                                                                .and_then(|l| {
+                                                                    l.strip_prefix("site:")
+                                                                })
+                                                                .map(|s| {
+                                                                    s.trim()
+                                                                        .trim_matches('"')
+                                                                        .to_string()
+                                                                })
+                                                                .unwrap_or_else(|| {
+                                                                    m.site_name.clone()
+                                                                });
+                                                            let yaml_name = yaml
+                                                                .lines()
                                                                 .find(|l| l.starts_with("name:"))
-                                                                .and_then(|l| l.strip_prefix("name:"))
-                                                                .map(|s| s.trim().trim_matches('"').to_string())
-                                                                .unwrap_or_else(|| m.cmd_name.clone());
-                                                            save_adapter(&yaml_site, &yaml_name, &yaml);
+                                                                .and_then(|l| {
+                                                                    l.strip_prefix("name:")
+                                                                })
+                                                                .map(|s| {
+                                                                    s.trim()
+                                                                        .trim_matches('"')
+                                                                        .to_string()
+                                                                })
+                                                                .unwrap_or_else(|| {
+                                                                    m.cmd_name.clone()
+                                                                });
+                                                            save_adapter(
+                                                                &yaml_site, &yaml_name, &yaml,
+                                                            );
                                                             let _ = page.close().await;
                                                             return;
                                                         }
@@ -831,10 +1289,12 @@ async fn main() {
 
                             // Step 2: AI generation via server API
                             let ai_result = autocli_ai::generate_with_ai(
-                                page.as_ref(), url,
+                                page.as_ref(),
+                                url,
                                 goal.as_deref().unwrap_or("hot"),
                                 &token,
-                            ).await;
+                            )
+                            .await;
                             let _ = page.close().await;
 
                             match ai_result {
@@ -842,21 +1302,35 @@ async fn main() {
                                     save_adapter(&site, &name, &yaml);
                                     upload_adapter(&yaml).await;
                                 }
-                                Err(e) => { print_error(&e); std::process::exit(1); }
+                                Err(e) => {
+                                    print_error(&e);
+                                    std::process::exit(1);
+                                }
                             }
                         } else {
                             // Rule-based generation (existing flow)
-                            let gen_result = autocli_ai::generate(page.as_ref(), url, goal.as_deref().unwrap_or("")).await;
+                            let gen_result = autocli_ai::generate(
+                                page.as_ref(),
+                                url,
+                                goal.as_deref().unwrap_or(""),
+                            )
+                            .await;
                             let _ = page.close().await;
                             match gen_result {
                                 Ok(candidate) => {
                                     save_adapter(&candidate.site, &candidate.name, &candidate.yaml);
                                 }
-                                Err(e) => { print_error(&e); std::process::exit(1); }
+                                Err(e) => {
+                                    print_error(&e);
+                                    std::process::exit(1);
+                                }
                             }
                         }
                     }
-                    Err(e) => { print_error(&e); std::process::exit(1); }
+                    Err(e) => {
+                        print_error(&e);
+                        std::process::exit(1);
+                    }
                 }
                 return;
             }
@@ -877,9 +1351,7 @@ async fn main() {
                 None => vec![],
             };
 
-            match autocli_external::execute_external_cli(&ext.name, &ext.binary, &ext_args)
-                .await
-            {
+            match autocli_external::execute_external_cli(&ext.name, &ext.binary, &ext_args).await {
                 Ok(status) => {
                     std::process::exit(status.code().unwrap_or(1));
                 }

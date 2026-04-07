@@ -1,15 +1,16 @@
+use autocli_core::CliError;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
         State, WebSocketUpgrade,
     },
+    http::header::ORIGIN,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use futures::{SinkExt, StreamExt};
-use autocli_core::CliError;
 use serde_json::json;
 use std::{
     collections::HashMap,
@@ -19,6 +20,7 @@ use std::{
 use tokio::sync::{oneshot, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
+use crate::auth::load_or_create_daemon_token;
 use crate::types::{DaemonCommand, DaemonResult};
 
 /// Command response timeout.
@@ -36,15 +38,17 @@ pub struct DaemonState {
     pub pending_commands: RwLock<PendingMap>,
     pub extension_connected: RwLock<bool>,
     pub last_activity: RwLock<Instant>,
+    pub auth_token: String,
 }
 
 impl DaemonState {
-    fn new() -> Self {
+    fn new(auth_token: String) -> Self {
         Self {
             extension_tx: Mutex::new(None),
             pending_commands: RwLock::new(HashMap::new()),
             extension_connected: RwLock::new(false),
             last_activity: RwLock::new(Instant::now()),
+            auth_token,
         }
     }
 
@@ -62,13 +66,9 @@ pub struct Daemon {
 impl Daemon {
     /// Start the daemon server on the given port. Returns immediately after the listener binds.
     pub async fn start(port: u16) -> Result<Self, CliError> {
-        let state = Arc::new(DaemonState::new());
+        let auth_token = load_or_create_daemon_token()?;
+        let state = Arc::new(DaemonState::new(auth_token));
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
-        let cors = tower_http::cors::CorsLayer::new()
-            .allow_origin(tower_http::cors::Any)
-            .allow_methods(tower_http::cors::Any)
-            .allow_headers(tower_http::cors::Any);
 
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -76,7 +76,6 @@ impl Daemon {
             .route("/status", get(status_handler))
             .route("/command", post(command_handler))
             .route("/ext", get(ws_handler))
-            .layer(cors)
             .with_state(state.clone());
 
         let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
@@ -136,9 +135,41 @@ async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+fn unauthorized_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "Missing or invalid daemon token" })),
+    )
+}
+
+fn is_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
+    headers
+        .get("x-autocli-token")
+        .or_else(|| headers.get("x-opencli-token"))
+        .and_then(|value| value.to_str().ok())
+        .map(|token| token == expected_token)
+        .unwrap_or(false)
+}
+
+fn websocket_origin_allowed(headers: &HeaderMap) -> bool {
+    headers
+        .get(ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(|origin| {
+            origin.starts_with("chrome-extension://") || origin.starts_with("moz-extension://")
+        })
+        .unwrap_or(false)
+}
+
 /// GET /status — return daemon and extension status.
 /// Compatible with both autocli and original opencli formats.
-async fn status_handler(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+async fn status_handler(
+    State(state): State<Arc<DaemonState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !is_authorized(&headers, &state.auth_token) {
+        return unauthorized_response().into_response();
+    }
     let ext = *state.extension_connected.read().await;
     let pending = state.pending_commands.read().await.len();
     Json(json!({
@@ -149,6 +180,7 @@ async fn status_handler(State(state): State<Arc<DaemonState>>) -> impl IntoRespo
         "extensionConnected": ext,
         "pending": pending,
     }))
+    .into_response()
 }
 
 /// POST /command — accept a command from the CLI and forward to the extension.
@@ -157,12 +189,8 @@ async fn command_handler(
     headers: HeaderMap,
     Json(cmd): Json<DaemonCommand>,
 ) -> impl IntoResponse {
-    // Security: require X-AutoCLI or X-OpenCLI header (backward compatible)
-    if !headers.contains_key("x-autocli") && !headers.contains_key("x-opencli") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "Missing X-AutoCLI header" })),
-        );
+    if !is_authorized(&headers, &state.auth_token) {
+        return unauthorized_response();
     }
 
     state.touch().await;
@@ -179,7 +207,11 @@ async fn command_handler(
 
     // Create a oneshot channel for the result
     let (tx, rx) = oneshot::channel::<DaemonResult>();
-    state.pending_commands.write().await.insert(cmd_id.clone(), tx);
+    state
+        .pending_commands
+        .write()
+        .await
+        .insert(cmd_id.clone(), tx);
 
     // Forward command to extension via WebSocket
     {
@@ -210,7 +242,10 @@ async fn command_handler(
             } else {
                 StatusCode::UNPROCESSABLE_ENTITY
             };
-            (status, Json(serde_json::to_value(result).unwrap_or(json!({}))))
+            (
+                status,
+                Json(serde_json::to_value(result).unwrap_or(json!({}))),
+            )
         }
         Ok(Err(_)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -229,9 +264,18 @@ async fn command_handler(
 /// GET /ext — WebSocket upgrade for Chrome extension.
 async fn ws_handler(
     State(state): State<Arc<DaemonState>>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    if !websocket_origin_allowed(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "WebSocket origin not allowed" })),
+        )
+            .into_response();
+    }
     ws.on_upgrade(move |socket| handle_extension_ws(state, socket))
+        .into_response()
 }
 
 async fn handle_extension_ws(state: Arc<DaemonState>, socket: WebSocket) {
@@ -326,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_daemon_state_touch() {
-        let state = DaemonState::new();
+        let state = DaemonState::new("test-token".to_string());
         let before = *state.last_activity.read().await;
         tokio::time::sleep(Duration::from_millis(10)).await;
         state.touch().await;

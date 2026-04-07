@@ -1,6 +1,7 @@
 // Architecture and protocol design derived from OpenCLI
 // (https://github.com/jackwener/opencli) by jackwener, Apache-2.0
 
+pub mod auth;
 pub mod types;
 pub mod daemon_client;
 pub mod page;
