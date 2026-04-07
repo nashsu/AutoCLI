@@ -3,12 +3,14 @@ use serde_json::Value;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+use crate::auth::load_or_create_daemon_token;
 use crate::types::{DaemonCommand, DaemonResult};
 
 /// HTTP client that communicates with the Daemon server.
 pub struct DaemonClient {
     base_url: String,
     client: reqwest::Client,
+    auth_token: Option<String>,
 }
 
 /// Retry delays for exponential backoff.
@@ -21,9 +23,26 @@ impl DaemonClient {
             .timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build reqwest client");
+        let auth_token = match load_or_create_daemon_token() {
+            Ok(token) => Some(token),
+            Err(err) => {
+                warn!(error = %err, "failed to load daemon token");
+                None
+            }
+        };
         Self {
             base_url: format!("http://127.0.0.1:{port}"),
             client,
+            auth_token,
+        }
+    }
+
+    fn with_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let request = request.header("X-AutoCLI", "1");
+        if let Some(token) = &self.auth_token {
+            request.header("X-AutoCLI-Token", token)
+        } else {
+            request
         }
     }
 
@@ -38,9 +57,7 @@ impl DaemonClient {
             debug!(attempt = attempt + 1, action = %cmd.action, "sending daemon command");
 
             let result = self
-                .client
-                .post(&url)
-                .header("X-AutoCLI", "1")
+                .with_auth(self.client.post(&url))
                 .json(&cmd)
                 .send()
                 .await;
@@ -51,7 +68,9 @@ impl DaemonClient {
 
                     if status.is_success() {
                         let daemon_result: DaemonResult = resp.json().await.map_err(|e| {
-                            CliError::browser_connect(format!("Failed to parse daemon response: {e}"))
+                            CliError::browser_connect(format!(
+                                "Failed to parse daemon response: {e}"
+                            ))
                         })?;
                         if daemon_result.ok {
                             return Ok(daemon_result.data.unwrap_or(Value::Null));
@@ -122,8 +141,7 @@ impl DaemonClient {
     /// Compatible with both autocli (`extension` field) and original opencli (`extensionConnected` field).
     pub async fn is_extension_connected(&self) -> bool {
         let url = format!("{}/status", self.base_url);
-        // Original OpenCLI requires X-AutoCLI header on all requests
-        match self.client.get(&url).header("X-AutoCLI", "1").send().await {
+        match self.with_auth(self.client.get(&url)).send().await {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(json) = resp.json::<Value>().await {
                     // Our format: {"extension": bool}
